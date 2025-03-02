@@ -1,0 +1,7 @@
+beautifulsoup4==4.12.2
+bs4
+streamlit
+folium
+requests
+python-dotenv
+together
