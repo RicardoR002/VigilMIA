@@ -1,7 +1,8 @@
-beautifulsoup4==4.12.2
-streamlit
-folium
-requests
-python-dotenv
-together
-geopy
+streamlit>=1.42.0  
+requests>=2.32.3   
+beautifulsoup4>=4.13.2 
+geopy>=2.4.1       
+pandas>=2.2.3     
+together>=0.2.3    
+pydeck>=0.8.0      
+python-dateutil>=2.9.0  
