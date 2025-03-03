@@ -9,81 +9,77 @@ from requests.exceptions import RequestException
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 import time
+import pydeck as pdk  
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 1. Configure Secrets (via Streamlit Cloud)
+# Configure Secrets
 TOGETHER_API_KEY = st.secrets.get("TOGETHER_API_KEY")
 
-# Initialize Together client at module level
+# Initialize Together client
 try:
     together_client = Together(api_key=TOGETHER_API_KEY)
 except Exception as e:
     logger.error(f"Failed to initialize Together client: {e}")
     together_client = None
 
-# Cache for geocoding results
+# Cache for geocoding
 @st.cache_data(ttl=86400)
 def get_cached_coordinates(address: str) -> Optional[tuple[float, float]]:
-    """Get cached coordinates for an address."""
     return geocode_address(address)
 
 def parse_incidents(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    """Parse incident data from BeautifulSoup object."""
     incidents = []
     try:
-        # Find all tables and rows
-        tables = soup.find_all('table')
+        # Target the main content table specifically
+        main_table = soup.find('table', {'cellpadding': '2', 'cellspacing': '0'})
         
-        # Debug: Show number of tables found
-        st.write(f"Found {len(tables)} tables in response")
+        if not main_table:
+            st.error("Main incident table not found in response")
+            return []
+            
+        rows = main_table.find_all('tr')[1:]  # Skip header
         
-        for table in tables:
-            rows = table.find_all('tr')[1:]  # Skip header row
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) >= 6:
-                    incident = {
-                        'time': cols[0].text.strip(),
-                        'type': cols[1].text.strip(),
-                        'location': cols[2].text.strip(),
-                        'units': cols[3].text.strip(),
-                        'status': cols[4].text.strip(),
-                        'details': cols[5].text.strip()
-                    }
-                    incidents.append(incident)
-                    
-                    # Debug: Show parsed incident
-                    st.write(f"Parsed incident: {incident}")
-    
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) >= 6:
+                incident = {
+                    'time': cols[0].text.strip(),
+                    'type': cols[1].text.strip(),
+                    'location': cols[2].text.strip(),
+                    'units': cols[3].text.strip().replace('\n', ', '),
+                    'status': cols[4].text.strip(),
+                    'details': cols[5].text.strip()
+                }
+                incidents.append(incident)
+                
+        # Debug output
+        if not incidents:
+            st.write("Raw table data:", main_table.prettify())
+            
     except Exception as e:
-        logger.error(f"Error parsing incidents: {e}")
-        st.error(f"Parsing error: {str(e)}")
+        logger.error(f"Parsing error: {e}")
+        st.error(f"Failed to parse incidents: {str(e)}")
         
     return incidents
 
 def geocode_address(address: str) -> Optional[tuple[float, float]]:
-    """Geocode an address to (latitude, longitude)."""
     try:
         geolocator = Nominatim(user_agent="VigilMIA")
         full_address = f"{address}, Miami-Dade, FL"
         location = geolocator.geocode(full_address, timeout=10)
         return (location.latitude, location.longitude) if location else None
-    except GeocoderTimedOut:
-        logger.warning(f"Geocoding timed out for address: {address}")
-        return None
     except Exception as e:
-        logger.error(f"Geocoding error: {e}")
+        logger.warning(f"Geocoding failed for {address}: {e}")
         return None
 
 @st.cache_data(ttl=3600)
 def process_for_mapping(incidents: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Convert incidents to DataFrame with geocoded coordinates."""
     if not incidents:
-        return pd.DataFrame(columns=['lat', 'lon', 'type', 'details', 'location', 'status'])
-    
+        return pd.DataFrame()
+
     df = pd.DataFrame(incidents)
     coordinates = []
     
@@ -99,64 +95,66 @@ def process_for_mapping(incidents: List[Dict[str, Any]]) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner="Fetching live emergency data...")
 def fetch_live_data() -> List[Dict[str, Any]]:
-    """Fetch live emergency data with enhanced error handling."""
     try:
-        # Add cache-buster parameter
-        timestamp = int(time.time())
-        cad_url = f"https://www.miamidade.gov/firecad/calls_include.asp?_={timestamp}"
-        
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
         }
         
+        # Add random query parameter to bypass cache
+        cad_url = f"https://www.miamidade.gov/firecad/calls_include.asp?t={time.time()}"
         response = requests.get(cad_url, headers=headers, timeout=15)
         response.raise_for_status()
         
-        # Validate response content
         if len(response.content) < 500:
-            st.error("Received incomplete response from server")
+            st.error("Incomplete response received")
             return []
-            
+
         soup = BeautifulSoup(response.content, 'html.parser')
         return parse_incidents(soup)
         
-    except RequestException as e:
-        logger.error(f"Network error: {str(e)}")
-        st.error("Unable to connect to emergency data server")
-        return []
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Fetch error: {e}")
+        st.error("Failed to retrieve emergency data")
         return []
 
-def generate_safety_tips(incidents: List[Dict[str, Any]], placeholder: st.empty) -> str:
-    """Generate safety tips based on current incidents."""
-    if not together_client or not incidents:
-        return "Unable to generate safety tips at this time."
+def create_interactive_map(df: pd.DataFrame):
+    """Create a PyDeck map with tooltips"""
+    if df.empty:
+        return
     
-    try:
-        incident_summary = "\n".join([f"- {inc['type']} at {inc['location']}" for inc in incidents[:3]])
-        prompt = f"""Current emergencies:\n{incident_summary}\nProvide 3 safety tips:"""
-        
-        response = together_client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            stream=True
-        )
-        
-        full_response = ""
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                full_response += chunk.choices[0].delta.content
-                placeholder.markdown(full_response + "▌")
-                
-        placeholder.markdown(full_response)
-        return full_response
-        
-    except Exception as e:
-        logger.error(f"AI error: {str(e)}")
-        return "Safety tips service unavailable"
+    layer = pdk.Layer(
+        'ScatterplotLayer',
+        data=df,
+        get_position='[lon, lat]',
+        get_color='[200, 30, 0, 160]',
+        get_radius=100,
+        pickable=True
+    )
+    
+    tooltip = {
+        "html": "<b>Type:</b> {type}<br/>"
+                "<b>Location:</b> {location}<br/>"
+                "<b>Time:</b> {time}<br/>"
+                "<b>Status:</b> {status}",
+        "style": {
+            "backgroundColor": "steelblue",
+            "color": "white"
+        }
+    }
+    
+    st.pydeck_chart(pdk.Deck(
+        map_style='mapbox://styles/mapbox/light-v9',
+        initial_view_state=pdk.ViewState(
+            latitude=25.7617,
+            longitude=-80.1918,
+            zoom=10,
+            pitch=50,
+        ),
+        layers=[layer],
+        tooltip=tooltip
+    ))
 
 def main():
     st.set_page_config(
@@ -179,7 +177,7 @@ def main():
         st.cache_data.clear()
         st.rerun()
     
-    with st.spinner("Loading emergency data..."):
+    with st.spinner("Loading real-time emergency data..."):
         incidents = fetch_live_data()
     
     col1, col2 = st.columns([2, 1])
@@ -187,14 +185,25 @@ def main():
     with col1:
         st.subheader("📍 Live Emergency Map")
         df = process_for_mapping(incidents)
+        
         if not df.empty:
-            st.map(df, latitude='lat', longitude='lon', color='#FF4B4B', size=50)
+            create_interactive_map(df)
         else:
             st.info("No active incidents to display")
         
         st.subheader("📊 Active Incidents")
         if incidents:
-            st.dataframe(pd.DataFrame(incidents), use_container_width=True, hide_index=True)
+            st.dataframe(
+                df[['time', 'type', 'location', 'status']],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "time": "Time",
+                    "type": "Incident Type",
+                    "location": "Location",
+                    "status": "Status"
+                }
+            )
         else:
             st.info("No current incidents reported")
     
