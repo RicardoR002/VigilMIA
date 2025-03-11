@@ -19,6 +19,15 @@ st.set_page_config(
 st.title("Miami-Dade Fire Rescue Incident Map")
 st.markdown("Real-time visualization of emergency incidents from Miami-Dade Fire Rescue CAD system")
 
+# Debug mode (hidden in sidebar)
+with st.sidebar:
+    debug_mode = st.checkbox("Debug Mode", value=False, help="Show debugging information")
+    parsing_method = st.radio(
+        "Parsing Method",
+        ["Standard", "Alternative"],
+        help="Choose the method to parse the CAD data"
+    )
+
 # Function to scrape incident data
 @st.cache_data(ttl=300)  # Cache data for 5 minutes
 def get_incident_data():
@@ -27,77 +36,256 @@ def get_incident_data():
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         
+        if debug_mode:
+            st.sidebar.write("Response status code:", response.status_code)
+            st.sidebar.write("Response content length:", len(response.text))
+        
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Find all tables - each section (North, Central, South, etc.) has its own table
-        tables = soup.find_all('table')
+        # Choose parsing method
+        if parsing_method == "Standard":
+            df = parse_standard_method(soup)
+        else:
+            df = parse_alternative_method(soup)
         
-        if not tables:
-            st.error("Could not find incident data tables on the webpage")
-            return pd.DataFrame()
-        
-        # Extract section headers
-        section_headers = []
-        for header in soup.find_all('h5'):
-            text = header.get_text().strip()
-            if "Calls" in text:
-                # Extract section name (e.g., "NORTH - 9 Calls" -> "NORTH")
-                section = text.split('-')[0].strip()
-                section_headers.append(section)
-        
-        # Process each table and combine data
-        all_data = []
-        
-        for i, table in enumerate(tables):
-            if i >= len(section_headers):
-                section = "Unknown"
-            else:
-                section = section_headers[i]
-            
-            # Extract rows from table
-            rows = []
-            for tr in table.find_all('tr'):
-                cells = [td.get_text().strip() for td in tr.find_all('td')]
-                if cells and len(cells) > 1:  # Skip empty rows
-                    rows.append(cells)
-            
-            # Skip tables with no data
-            if not rows:
-                continue
-                
-            # Process the rows to extract incident data
-            # The data structure is in groups of rows, where each incident spans multiple rows
-            current_incident = {}
-            for row in rows:
-                # Check if this is a header row or data row
-                if len(row) == 1 and row[0] in ['RCVD', 'FC', 'INC TYPE', 'ADDRESS', 'UNITS']:
-                    current_header = row[0]
-                else:
-                    # This is a data row
-                    if current_header == 'RCVD':
-                        current_incident = {'RCVD': row[0], 'Section': section}
-                    elif current_header == 'FC' and current_incident:
-                        current_incident['FC'] = row[0] if row else ''
-                    elif current_header == 'INC TYPE' and current_incident:
-                        current_incident['INC TYPE'] = row[0] if row else ''
-                    elif current_header == 'ADDRESS' and current_incident:
-                        current_incident['ADDRESS'] = row[0] if row else ''
-                    elif current_header == 'UNITS' and current_incident:
-                        current_incident['UNITS'] = row[0] if row else ''
-                        # Add the completed incident to our data
-                        all_data.append(current_incident.copy())
-        
-        # Create DataFrame
-        if all_data:
-            df = pd.DataFrame(all_data)
-            # Clean and process data
+        if not df.empty:
             return process_data(df)
         else:
             st.warning("No incident data found")
             return pd.DataFrame()
     
     except Exception as e:
-        st.error(f"Error fetching incident data: {e}")
+        st.error(f"Error fetching incident data: {str(e)}")
+        if debug_mode:
+            st.sidebar.write("Exception details:", str(e))
+            import traceback
+            st.sidebar.code(traceback.format_exc())
+        return pd.DataFrame()
+
+# Standard parsing method
+def parse_standard_method(soup):
+    # Find all section headers (NORTH, CENTRAL, SOUTH, etc.)
+    section_headers = []
+    for header in soup.find_all('h5'):
+        text = header.get_text().strip()
+        if "Calls" in text:
+            # Extract section name (e.g., "NORTH - 9 Calls" -> "NORTH")
+            section = text.split('-')[0].strip()
+            section_headers.append(section)
+    
+    if debug_mode:
+        st.sidebar.write("Found sections:", section_headers)
+    
+    # Find all tables
+    tables = soup.find_all('table')
+    
+    if not tables:
+        st.error("Could not find incident data tables on the webpage")
+        if debug_mode:
+            st.sidebar.write("HTML content preview:", soup.prettify()[:500])
+        return pd.DataFrame()
+    
+    if debug_mode:
+        st.sidebar.write("Found tables:", len(tables))
+    
+    # Process each table and combine data
+    all_data = []
+    
+    for i, table in enumerate(tables):
+        # Skip tables that don't correspond to incident data
+        if i >= len(section_headers):
+            continue
+            
+        section = section_headers[i]
+        
+        if debug_mode:
+            st.sidebar.write(f"Processing section: {section}")
+        
+        # Extract all rows from the table
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = [td.get_text().strip() for td in tr.find_all('td')]
+            if cells:  # Skip empty rows
+                rows.append(cells)
+        
+        # Skip tables with no data
+        if not rows:
+            if debug_mode:
+                st.sidebar.write(f"No rows found in section {section}")
+            continue
+        
+        if debug_mode:
+            st.sidebar.write(f"Found {len(rows)} rows in section {section}")
+            if len(rows) > 0:
+                st.sidebar.write("Sample row:", rows[0])
+        
+        # Process the rows to extract incident data
+        # The data structure is in vertical format where each incident has multiple rows
+        j = 0
+        while j < len(rows):
+            # Check if this is the start of a new incident (time received)
+            if len(rows[j]) == 1 and rows[j][0] and rows[j][0].strip() and ':' in rows[j][0]:
+                # This looks like a time (e.g., "21:09")
+                incident = {'RCVD': rows[j][0], 'Section': section}
+                
+                # Look for Fire Code (FC)
+                j += 1
+                if j < len(rows) and len(rows[j]) == 1:
+                    incident['FC'] = rows[j][0]
+                else:
+                    incident['FC'] = ''
+                    j -= 1  # Go back if not found
+                
+                # Look for Incident Type
+                j += 1
+                if j < len(rows) and len(rows[j]) == 1:
+                    incident['INC TYPE'] = rows[j][0]
+                else:
+                    incident['INC TYPE'] = ''
+                    j -= 1  # Go back if not found
+                
+                # Look for Address
+                j += 1
+                if j < len(rows) and len(rows[j]) == 1:
+                    incident['ADDRESS'] = rows[j][0]
+                else:
+                    incident['ADDRESS'] = ''
+                    j -= 1  # Go back if not found
+                
+                # Look for Units
+                j += 1
+                if j < len(rows) and len(rows[j]) == 1:
+                    incident['UNITS'] = rows[j][0]
+                else:
+                    incident['UNITS'] = ''
+                    j -= 1  # Go back if not found
+                
+                # Add the completed incident to our data
+                all_data.append(incident)
+                
+                if debug_mode and len(all_data) <= 3:
+                    st.sidebar.write(f"Extracted incident: {incident}")
+            
+            j += 1
+    
+    # Create DataFrame
+    if all_data:
+        df = pd.DataFrame(all_data)
+        if debug_mode:
+            st.sidebar.write(f"Created DataFrame with {len(df)} rows")
+        return df
+    else:
+        if debug_mode:
+            st.sidebar.write("No incidents were extracted from the tables")
+        return pd.DataFrame()
+
+# Alternative parsing method
+def parse_alternative_method(soup):
+    # This method tries to extract data by looking for patterns in the HTML
+    all_data = []
+    
+    # Find all section divs
+    sections = soup.find_all('div', class_='card-body')
+    
+    if not sections:
+        if debug_mode:
+            st.sidebar.write("No section divs found")
+        return pd.DataFrame()
+    
+    if debug_mode:
+        st.sidebar.write(f"Found {len(sections)} section divs")
+    
+    for section_div in sections:
+        # Try to find the section name
+        section_header = section_div.find_previous('h5')
+        if section_header and "Calls" in section_header.text:
+            section = section_header.text.split('-')[0].strip()
+        else:
+            section = "Unknown"
+        
+        if debug_mode:
+            st.sidebar.write(f"Processing section: {section}")
+        
+        # Find all text in this section
+        text = section_div.get_text()
+        
+        # Split by common patterns
+        incidents = re.split(r'\n\s*\n', text)
+        
+        for incident_text in incidents:
+            # Skip empty incidents
+            if not incident_text.strip():
+                continue
+            
+            # Try to extract incident details
+            lines = incident_text.strip().split('\n')
+            lines = [line.strip() for line in lines if line.strip()]
+            
+            if not lines:
+                continue
+            
+            # Initialize incident data
+            incident = {'Section': section}
+            
+            # Try to find time received (usually has format like "21:09")
+            for line in lines:
+                if re.match(r'\d{1,2}:\d{2}', line):
+                    incident['RCVD'] = line
+                    break
+            
+            # Try to find incident type (common types: MEDICAL, FIRE, etc.)
+            incident_types = ['MEDICAL', 'FIRE', 'ALARM', 'OTHER', 'HAZMAT', 'EXPLOSIVE']
+            for line in lines:
+                if any(itype in line for itype in incident_types):
+                    incident['INC TYPE'] = line
+                    break
+            
+            # Try to find address (usually contains "BLOCK", "ST", "AVE", etc.)
+            address_patterns = ['BLOCK', 'ST', 'AVE', 'RD', 'BLVD', 'DR', 'LN', 'CT', 'WAY']
+            for line in lines:
+                if any(pattern in line for pattern in address_patterns):
+                    incident['ADDRESS'] = line
+                    break
+            
+            # Try to find units (usually contains E, R, B followed by numbers)
+            unit_pattern = r'[ERB]\d{1,3}'
+            for line in lines:
+                if re.search(unit_pattern, line):
+                    incident['UNITS'] = line
+                    break
+            
+            # Try to find fire code (usually C1, C2, C3, etc.)
+            fc_pattern = r'C\d'
+            for line in lines:
+                if re.match(fc_pattern, line):
+                    incident['FC'] = line
+                    break
+            
+            # Ensure all required fields exist
+            for field in ['RCVD', 'INC TYPE', 'ADDRESS', 'UNITS']:
+                if field not in incident:
+                    incident[field] = ''
+            
+            # Add FC if not found
+            if 'FC' not in incident:
+                incident['FC'] = ''
+            
+            # Only add if we have at least time and address
+            if incident['RCVD'] and incident['ADDRESS']:
+                all_data.append(incident)
+                
+                if debug_mode and len(all_data) <= 3:
+                    st.sidebar.write(f"Extracted incident: {incident}")
+    
+    # Create DataFrame
+    if all_data:
+        df = pd.DataFrame(all_data)
+        if debug_mode:
+            st.sidebar.write(f"Created DataFrame with {len(df)} rows")
+        return df
+    else:
+        if debug_mode:
+            st.sidebar.write("No incidents were extracted using alternative method")
         return pd.DataFrame()
 
 # Function to process and clean the data
